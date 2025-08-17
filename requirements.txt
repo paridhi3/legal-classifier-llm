@@ -1,0 +1,8 @@
+streamlit
+python-dotenv
+openai
+langchain
+langchain-community
+pdfplumber
+pytesseract
+pillow
