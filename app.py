@@ -2,82 +2,126 @@ import os
 import io
 import pdfplumber
 import pytesseract
-from PIL import Image
+import pandas as pd
 import streamlit as st
+from PIL import Image
 from dotenv import load_dotenv
-from openai import OpenAI
 
+# LangChain + Azure OpenAI
+from langchain_openai import AzureChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.agents import create_tool_calling_agent, AgentExecutor, tool
+
+# ---------------------------
 # Load environment variables
+# ---------------------------
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ---------- Utilities ----------
+llm = AzureChatOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_END_POINT"),
+    deployment_name=os.getenv("DEPLOYMENT_NAME"),
+    model=os.getenv("MODEL_NAME"),
+    api_version=os.getenv("API_VERSION"),
+    temperature=0
+)
+
+# ---------------------------
+# Utilities for Text Extraction
+# ---------------------------
 def extract_text_from_pdf(file_bytes):
     text = ""
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
-            text += page.extract_text() or ""
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
     return text.strip()
 
 def extract_text_from_image(file_bytes):
     image = Image.open(io.BytesIO(file_bytes))
     return pytesseract.image_to_string(image)
 
-def classify(content: str):
-    """Send text content to GPT-4o-mini for classification"""
-    prompt = f"""
-    You are a legal document classifier.
-    Classify the following document as either 'Judgement' or 'Non-Judgement'.
-
-    Document Content:
-    {content[:5000]}  # limit length
+# ---------------------------
+# Tool: Classifier
+# ---------------------------
+@tool
+def classifier(document_text: str) -> str:
     """
+    Classify a given legal document's text into 'Judgement' or 'Non-Judgement'.
+    """
+    classification_prompt = f"""
+    You are a legal document classifier. 
+    Determine if the following document is a **Judgement** issued by a court, 
+    or a **Non-Judgement** (such as a contract, agreement, letter, application, etc.).
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a helpful legal document classifier."},
-            {"role": "user", "content": prompt}
-        ]
-    )
+    Document text:
+    {document_text[:5000]}
 
-    return response.choices[0].message.content
+    Respond ONLY with 'Judgement' or 'Non-Judgement'.
+    """
+    response = llm.invoke([{"role": "user", "content": classification_prompt}])
+    return response.content.strip()
 
-# ---------- Streamlit UI ----------
-st.set_page_config(page_title="LLM Legal Document Classifier", page_icon="⚖️")
-st.title("⚖️ LLM Agent - Legal Document Classifier")
-st.write("Upload a PDF or Image, and classify it as **Judgement** or **Non-Judgement** using GPT-4o Agents.")
+# ---------------------------
+# Agent Setup
+# ---------------------------
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a legal document classification agent."),
+    ("human", "{input}"),
+    ("placeholder", "{agent_scratchpad}")
+])
 
-uploaded_file = st.file_uploader("Upload Document", type=["pdf", "png", "jpg", "jpeg"])
+tools = [classifier]
+agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-if uploaded_file:
-    file_bytes = uploaded_file.read()
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.set_page_config(page_title="Legal Document Classifier", page_icon="⚖️", layout="centered")
+st.title("⚖️ Legal Document Classifier (LLM Agent)")
+st.write("Upload one or more legal documents (PDF or image) to classify as **Judgement** or **Non-Judgement** using GPT-powered agents.")
 
-    # Determine file type
-    if uploaded_file.type == "application/pdf":
-        st.info("Extracting text from PDF...")
-        content = extract_text_from_pdf(file_bytes)
-    else:
-        st.info("Extracting text from Image using OCR...")
-        content = extract_text_from_image(file_bytes)
+uploaded_files = st.file_uploader(
+    "Upload PDF or image files", 
+    type=["pdf", "png", "jpg", "jpeg"], 
+    accept_multiple_files=True
+)
 
-    if not content.strip():
-        st.warning("No text extracted. Falling back to Vision-based classification...")
-        # Send the raw image/PDF page to GPT-4o Vision
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a legal document classifier."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "Classify this document as Judgement or Non-Judgement."},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + file_bytes.decode("latin1")}}
-                ]}
-            ]
-        )
-        result = response.choices[0].message.content
-    else:
-        st.text_area("Extracted Text (first 1000 chars)", content[:1000])
-        result = classify_with_gpt(content)
+if uploaded_files:
+    st.info("Processing documents... Please wait ⏳")
 
-    st.success("✅ Classification Result")
-    st.write(result)
+    results = []
+
+    for uploaded_file in uploaded_files:
+        file_bytes = uploaded_file.read()
+
+        # Extract text depending on file type
+        if uploaded_file.type == "application/pdf":
+            content = extract_text_from_pdf(file_bytes)
+        else:
+            content = extract_text_from_image(file_bytes)
+
+        if not content.strip():
+            category = "Unclassified (No text found)"
+            confidence = "N/A"
+        else:
+            try:
+                result = agent_executor.invoke({"input": content})
+                category = result["output"]
+                confidence = "LLM classification (no score)"
+            except Exception as e:
+                category = "Error"
+                confidence = str(e)
+
+        results.append({
+            "File Name": uploaded_file.name,
+            "Category": category,
+            "Confidence": confidence
+        })
+
+    # Display results
+    st.success("✅ Classification complete!")
+    df = pd.DataFrame(results)
+    st.dataframe(df, use_container_width=True)
